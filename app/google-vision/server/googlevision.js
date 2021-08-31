@@ -1,29 +1,32 @@
 import { Meteor } from 'meteor/meteor';
 import { TAPi18n } from 'meteor/rocketchat:tap-i18n';
+import { Storage } from '@google-cloud/storage';
+import { ImageAnnotatorClient } from '@google-cloud/vision';
 
 import { settings } from '../../settings';
 import { callbacks } from '../../callbacks';
-import { Uploads, Settings, Users, Messages } from '../../models';
+import { Uploads, Settings, Users } from '../../models';
 import { FileUpload } from '../../file-upload';
 import { api } from '../../../server/sdk/api';
 
 class GoogleVision {
 	constructor() {
-		this.storage = require('@google-cloud/storage');
-		this.vision = require('@google-cloud/vision');
 		this.storageClient = {};
 		this.visionClient = {};
+		// this.detectSafeSearch = () => {};
 		this.enabled = settings.get('GoogleVision_Enable');
 		this.serviceAccount = {};
 		settings.get('GoogleVision_Enable', (key, value) => {
+			console.log('GoogleVision_Enable ->', value);
 			this.enabled = value;
 		});
 		settings.get('GoogleVision_ServiceAccount', (key, value) => {
 			try {
 				this.serviceAccount = JSON.parse(value);
-				this.storageClient = this.storage({ credentials: this.serviceAccount });
-				this.visionClient = this.vision({ credentials: this.serviceAccount });
+				this.storageClient = new Storage({ credentials: this.serviceAccount });
+				this.visionClient = new ImageAnnotatorClient({ credentials: this.serviceAccount });
 			} catch (e) {
+				console.error('deu ruim', e);
 				this.serviceAccount = {};
 			}
 		});
@@ -54,76 +57,112 @@ class GoogleVision {
 		return true;
 	}
 
-	blockUnsafeImages(message) {
-		if (this.enabled && this.serviceAccount && message && message.file && message.file._id) {
-			const file = Uploads.findOne({ _id: message.file._id });
-			if (file && file.type && file.type.indexOf('image') !== -1 && file.store === 'GoogleCloudStorage:Uploads' && file.GoogleStorage) {
-				if (this.incCallCount(1)) {
-					const bucket = this.storageClient.bucket(settings.get('FileUpload_GoogleStorage_Bucket'));
-					const bucketFile = bucket.file(file.GoogleStorage.path);
-					const results = Meteor.wrapAsync(this.visionClient.detectSafeSearch, this.visionClient)(bucketFile);
-					if (results && results.adult === true) {
-						FileUpload.getStore('Uploads').deleteById(file._id);
-						const user = Users.findOneById(message.u && message.u._id);
-						if (user) {
-							api.broadcast('notify.ephemeralMessage', user._id, message.rid, {
-								msg: TAPi18n.__('Adult_images_are_not_allowed', {}, user.language),
-							});
-						}
-						throw new Meteor.Error('GoogleVisionError: Image blocked');
-					}
-				} else {
-					console.error('Google Vision: Usage limit exceeded');
-				}
-				return message;
-			}
+	getFilePath(message, count = 1) {
+		if (!this.enabled || !this.serviceAccount || !message?.file?._id) {
+			return;
 		}
+
+		const file = Uploads.findOne({ _id: message.file._id });
+		if (!file) {
+			return;
+		}
+
+		if (!file.type?.indexOf('image') === -1 || file.store !== 'GoogleCloudStorage:Uploads' || !file.GoogleStorage) {
+			return;
+		}
+
+		if (!this.incCallCount(count)) {
+			console.error('Google Vision: Usage limit exceeded');
+			return;
+		}
+
+		return `gs://${ settings.get('FileUpload_GoogleStorage_Bucket') }/${ file.GoogleStorage.path }`;
 	}
 
-	annotate({ message }) {
-		const visionTypes = [];
-		if (settings.get('GoogleVision_Type_Document')) {
-			visionTypes.push('document');
+	blockUnsafeImages(message) {
+		const path = this.getFilePath(message);
+		if (!path) {
+			return message;
 		}
-		if (settings.get('GoogleVision_Type_Faces')) {
-			visionTypes.push('faces');
+
+		const [results] = Promise.await(this.visionClient.safeSearchDetection(path));
+
+		const detections = results.safeSearchAnnotation;
+
+		if (!['VERY_LIKELY', 'LIKELY'].includes(detections.adult)) {
+			return message;
 		}
-		if (settings.get('GoogleVision_Type_Landmarks')) {
-			visionTypes.push('landmarks');
+
+		FileUpload.getStore('Uploads').deleteById(message.file._id);
+		const user = Users.findOneById(message.u?._id, { fields: { language: 1 } });
+		if (user) {
+			api.broadcast('notify.ephemeralMessage', user._id, message.rid, {
+				msg: TAPi18n.__('Adult_images_are_not_allowed', {}, user.language || 'en'),
+			});
 		}
-		if (settings.get('GoogleVision_Type_Labels')) {
-			visionTypes.push('labels');
+		throw new Meteor.Error('GoogleVisionError: Image blocked');
+	}
+
+	annotate(data) {
+		// console.log('annotate ->', message);
+		const { message } = data;
+
+		const path = this.getFilePath(message);
+		if (!path) {
+			return data;
 		}
-		if (settings.get('GoogleVision_Type_Logos')) {
-			visionTypes.push('logos');
-		}
-		if (settings.get('GoogleVision_Type_Properties')) {
-			visionTypes.push('properties');
-		}
-		if (settings.get('GoogleVision_Type_SafeSearch')) {
-			visionTypes.push('safeSearch');
-		}
-		if (settings.get('GoogleVision_Type_Similar')) {
-			visionTypes.push('similar');
-		}
-		if (this.enabled && this.serviceAccount && visionTypes.length > 0 && message.file && message.file._id) {
-			const file = Uploads.findOne({ _id: message.file._id });
-			if (file && file.type && file.type.indexOf('image') !== -1 && file.store === 'GoogleCloudStorage:Uploads' && file.GoogleStorage) {
-				if (this.incCallCount(visionTypes.length)) {
-					const bucket = this.storageClient.bucket(settings.get('FileUpload_GoogleStorage_Bucket'));
-					const bucketFile = bucket.file(file.GoogleStorage.path);
-					this.visionClient.detect(bucketFile, visionTypes, Meteor.bindEnvironment((error, results) => {
-						if (!error) {
-							Messages.setGoogleVisionData(message._id, this.getAnnotations(visionTypes, results));
-						} else {
-							console.trace('GoogleVision error: ', error.stack);
-						}
-					}));
-				} else {
-					console.error('Google Vision: Usage limit exceeded');
-				}
-			}
-		}
+
+		console.log('path ->', path);
+
+		const [results] = Promise.await(this.visionClient.labelDetection(path));
+
+		console.log('annotateImage ->', results);
+
+		return data;
+
+		// const visionTypes = [];
+		// if (settings.get('GoogleVision_Type_Document')) {
+		// 	visionTypes.push('document');
+		// }
+		// if (settings.get('GoogleVision_Type_Faces')) {
+		// 	visionTypes.push('faces');
+		// }
+		// if (settings.get('GoogleVision_Type_Landmarks')) {
+		// 	visionTypes.push('landmarks');
+		// }
+		// if (settings.get('GoogleVision_Type_Labels')) {
+		// 	visionTypes.push('labels');
+		// }
+		// if (settings.get('GoogleVision_Type_Logos')) {
+		// 	visionTypes.push('logos');
+		// }
+		// if (settings.get('GoogleVision_Type_Properties')) {
+		// 	visionTypes.push('properties');
+		// }
+		// if (settings.get('GoogleVision_Type_SafeSearch')) {
+		// 	visionTypes.push('safeSearch');
+		// }
+		// if (settings.get('GoogleVision_Type_Similar')) {
+		// 	visionTypes.push('similar');
+		// }
+		// if (this.enabled && this.serviceAccount && visionTypes.length > 0 && message?.file?._id) {
+		// 	const file = Uploads.findOne({ _id: message.file._id });
+		// 	if (file && file.type && file.type.indexOf('image') !== -1 && file.store === 'GoogleCloudStorage:Uploads' && file.GoogleStorage) {
+		// 		if (this.incCallCount(visionTypes.length)) {
+		// 			const bucket = this.storageClient.bucket(settings.get('FileUpload_GoogleStorage_Bucket'));
+		// 			const bucketFile = bucket.file(file.GoogleStorage.path);
+		// 			this.visionClient.detect(bucketFile, visionTypes, Meteor.bindEnvironment((error, results) => {
+		// 				if (!error) {
+		// 					Messages.setGoogleVisionData(message._id, this.getAnnotations(visionTypes, results));
+		// 				} else {
+		// 					console.trace('GoogleVision error: ', error.stack);
+		// 				}
+		// 			}));
+		// 		} else {
+		// 			console.error('Google Vision: Usage limit exceeded');
+		// 		}
+		// 	}
+		// }
 	}
 
 	getAnnotations(visionTypes, visionData) {
@@ -155,5 +194,7 @@ class GoogleVision {
 		return results;
 	}
 }
+
+console.log('GoogleVision_Enable!!!!');
 
 export default new GoogleVision();
